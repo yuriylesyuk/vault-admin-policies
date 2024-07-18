@@ -18,6 +18,8 @@
 
 For some features we need ent version of vault. In this case, we use PATH to binary and the license file variable
 
+__DDTIP:__ Don't Do This In Production]
+
 ```sh
 mkdir -p ~/bin-vault-ent-1.17.2
 cd bin-vault-ent-1.17.2
@@ -100,9 +102,11 @@ vault status
 vault operator init -key-shares=1 -key-threshold=1 > vault-init.txt
 ```
 
+
 ```
 vault operator unseal $(awk '/Unseal Key 1:/{print $4}' vault-init.txt)
 ```
+### DDIP: Login as root token
 
 ```
 vault login $(awk '/Root Token:/{print $4}' vault-init.txt); export VAULT_TOKEN=$(cat ~/.vault-token)
@@ -126,41 +130,120 @@ Terraform v1.9.2
 on linux_amd64
 ```
 
+## Audit log in 'debug' mode [DDTIP]:
 
 ## Vault admin policies: CLI edition
 
 ```
+PROJECT_DIR=~/vault-admin-policies/vault
+
+vault audit enable file file_path=$PROJECT_DIR/audit.log log_raw=true
+```
+
+
+## Actors: 
+
+* __Adam Adams__ 
+    * __adam__: Administrator; 
+    * __aadams__: Super-Administrator
+* __Dave Davis__ 
+    * __dave__ Developer
+* __cicd__: Service Account
+* __terraform__: Service Account
+
+```
 vault auth enable userpass
 
-vault write auth/userpass/users/admin \
-    password=foo \
-    policies=admin_secrets_policy
-
-vault write auth/userpass/users/dev \
-    password=foo \
-    policies=developer_secrets_policy
-
-vault write auth/userpass/users/cicd \
-    password=foo \
-    policies=cicd_secrets_policy
+vault auth enable -path=userpass-superadmins userpass
 
 
 
+vault write auth/userpass/users/adam password=foo
+vault write auth/userpass-superadmins/users/aadams password=foo  policies="superadmin_secrets_policy"
+vault write auth/userpass/users/dave password=foo
+vault write auth/userpass/users/cicd password=foo policies=cicd_secrets_policy
 
 
-
-
-
-# Map users to their groups
-vault write identity/group-alias name="admin_alias" \
-    mount_accessor=$(vault auth list -format=json | jq -r '."userpass/".accessor') \
-    canonical_id=$(vault read -field=id identity/group/name/admins)
-
-vault write identity/group-alias name="dev_alias" \
-    canonical_id=$(vault read -field=id identity/entity/name/dev_user) \
-    mount_accessor=$(vault auth list -format=json | jq -r '."userpass/".accessor') \
-    group_id=$(vault read -field=id identity/group/name/developers)
+# check:
+vault list auth/userpass/users
 ```
+
+
+## Control Groups for escalating ability to access secret contents with developer's authorization 
+
+https://developer.hashicorp.com/vault/tutorials/enterprise/control-groups
+
+* requires Identity Groups as factor
+
+```
+# checks
+vault list identity/entity/name
+vault list -detailed identity/entity-alias/id
+
+vault read identity/group/name/admins
+vault read identity/group/name/superadmins
+
+# resets
+vault delete identity/entity/name/adam-adams
+vault delete identity/entity-alias/name/adam
+
+```
+
+
+```
+# Add users to their respective groups (example for admin_user and dev_user)
+vault write identity/entity name="adam-adams"
+
+
+vault write identity/entity-alias \
+    name="adam" \
+    canonical_id=$(vault read -field=id identity/entity/name/adam-adams) \
+    mount_accessor=$(vault auth list -format=json | jq -r '."userpass/".accessor') 
+
+vault write identity/entity-alias \
+    name="aadams" \
+    canonical_id=$(vault read -field=id identity/entity/name/adam-adams) \
+    mount_accessor=$(vault auth list -format=json | jq -r '."userpass-superadmins/".accessor') 
+
+
+
+vault write identity/entity name="dave-davis"
+
+vault write identity/entity-alias \
+    name="dave" \
+    canonical_id=$(vault read -field=id identity/entity/name/dave-davis) \
+    mount_accessor=$(vault auth list -format=json | jq -r '."userpass/".accessor') 
+
+
+
+# Create admin and superadmin groups
+vault write identity/group name="admins" policies="admin_secrets_policy"
+
+vault write identity/group name="superadmins"
+
+# Create developer group
+vault write identity/group name="developers" policies="developers_authorizers_policy"
+
+
+# add users to groups
+vault write identity/group name="admins" \
+    member_entity_ids=$(vault read -field=id identity/entity/name/adam-adams)
+
+vault write identity/group name="superadmins" \
+    member_entity_ids=$(vault read -field=id identity/entity/name/adam-adams)
+
+vault write identity/group name="developers" \
+    member_entity_ids=$(vault read -field=id identity/entity/name/dave-davis)
+```
+
+
+## check the config
+```
+vault read identity/group/name/superadmins
+
+vault read identity/group/name/developers
+```
+
 
 ## Workflow: Admin creates and Manages Secret Engines
 
@@ -175,11 +258,6 @@ vault token lookup
 ```sh
 # Admin: enabling a new KV secret engine
 
-vault login -method=userpass \
-    username=admin \
-    password=foo
-
-
 vault secrets enable -path=secret kv
 ```
 
@@ -190,9 +268,9 @@ vault secrets enable -path=secret kv
 
 1. Open bash terminals:
 
-    * super-admin: root, export VAULT_TOKEN=
-    * admin: admi, export VAULT_TOKEN=
-    * dev: dev, ~/.vault-token
+    * aadams, super-admin: root, export VAULT_TOKEN=
+    * adam, admin: admi, export VAULT_TOKEN=
+    * dave, dev: dev, ~/.vault-token
     * cicd: cicd, ~/.vault-token
 
 
@@ -200,7 +278,7 @@ When/if we are using a same Linux user terminals, ~/.vault-token gets overrriden
 
 1. Validation table:
 
-| Op                                                                 | Admin   | Dev     | Cicd    | Terraform |
+| Op                                                                 | Adam the Admin   | Dave the Dev     | Cicd    | Terraform |
 |---|:---:|:---:|:---:|:---:|
 | vault secrets enable -path=secret kv                               | &check; | &cross; | &cross; |
 | vault secrets disable secret                                       | &check; | &cross; | &cross; |
@@ -219,11 +297,14 @@ vault token create -policy=developer_secrets_policy -period=30m
 
 
 # Developer writing a secret
-vault login -method=userpass username=admin password=foo;   export VAULT_TOKEN=$(cat ~/.vault-token)
-vault login -method=userpass username=dev password=foo;     export VAULT_TOKEN=$(cat ~/.vault-token)
+vault login -method=userpass -path=userpass username=adam password=foo;   export VAULT_TOKEN=$(cat ~/.vault-token)
+vault login -method=userpass -path=userpass-superadmins username=aadams password=foo;    export VAULT_TOKEN=$(cat ~/.vault-token)
+vault login -method=userpass username=dave password=foo;     export VAULT_TOKEN=$(cat ~/.vault-token)
 vault login -method=userpass username=cicd password=foo;    export VAULT_TOKEN=$(cat ~/.vault-token)
 
 
+
+# test secretes
 vault kv put -output-policy -mount=secret creds username="user" password="password"
 vault kv put -mount=secret creds username="user" password="password"
 
@@ -241,7 +322,8 @@ vault kv get -mount=secret -field=db-user creds
 vault kv get secret/myapp/config
 ```
 
-Add policy option to only read keys / parameters of secrets 
+Add policy option to only read keys / parameters of secrets: 
+
 https://github.com/hashicorp/vault/issues/10704
 
 
@@ -258,63 +340,7 @@ vault read -format=json sys/internal/ui/resultant-acl
 ```
 
 
-## Control Groups for escalating ability to access secret contents with developer's authorization 
-
-https://developer.hashicorp.com/vault/tutorials/enterprise/control-groups
-
-* requires Identity Groups as factor
-
-[ ] in the admin_secrets_policy.hcl, instead of deny:
-
-```
-# Create superadmin group
-vault write identity/group name="admins" policies="admin_secrets_policy"
-
-vault write identity/group name="superadmins" policies="superadmin_secrets_policy"
-
-# Create developer group
-vault write identity/group name="developers" policies="developers_authorizers_policy"
-
-
-# Add users to their respective groups (example for admin_user and dev_user)
-vault write identity/entity name="superadmin"
-vault write identity/entity name="dev"
-
-vault write identity/group name="superadmins" \
-    member_entity_ids=$(vault read -field=id identity/entity/name/superadmin)
-
-vault write identity/group name="developers" \
-    member_entity_ids=$(vault read -field=id identity/entity/name/dev)
-
-
-# Map users to their groups
-vault write identity/entity-alias \
-    name="superadmin" \
-    canonical_id=$(vault read -field=id identity/entity/name/superadmin) \
-    mount_accessor=$(vault auth list -format=json | jq -r '."userpass/".accessor') 
-
-vault write identity/entity-alias \
-    name="dev" \
-    canonical_id=$(vault read -field=id identity/entity/name/dev) \
-    mount_accessor=$(vault auth list -format=json | jq -r '."userpass/".accessor') 
-
-
-# check the config
-vault read identity/group/name/superadmins
-
-vault read identity/group/name/developers
-```
-
-
-```
-vault write auth/userpass/users/superadmin password=foo
-
-vault login -method=userpass username=superadmin password=foo;    export VAULT_TOKEN=$(cat ~/.vault-token)
-```
-
-
-
-
+# Example Control Group:
 ```
 path "secret/*" {
     capabilities = ["write","read","list"]
@@ -330,27 +356,35 @@ path "secret/*" {
 }
 ```
 
-vault read -format=json sys/internal/ui/resultant-acl
 
-# superadmin: 
+## aadams, the superadmin: 
+```
 vault kv get secret/creds
 
 vault kv get -field=username secret/creds
 
 vault unwrap $WRAPPING_TOKEN
+```
 
-
-# dev:
+## dave the developer:
+```
 export WRAPPING_ACCESSOR=
 vault write sys/control-group/request accessor=$WRAPPING_ACCESSOR
 
 vault write sys/control-group/authorize accessor=$WRAPPING_ACCESSOR
+```
 
-# superadmin: 
+## aadams the superadmin: 
+
+```
 export WRAPPING_TOKEN=
 vault unwrap $WRAPPING_TOKEN
-
+```
 
 
 [ ] check audit
 [ ] raise alert??
+
+TODO: [ ] NOTE: Be careful in granting permissions to non-readonly identity endpoints. If a user can modify an entity, they can grant it additional privileges through policies. If a user can modify an alias they can login with, they can bind it to an entity with higher privileges
+https://developer.hashicorp.com/vault/api-docs/secret/identity/entity-alias
+
